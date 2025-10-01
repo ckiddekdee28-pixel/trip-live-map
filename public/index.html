@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Trip Live Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    :root { --gap: 10px; }
+    html, body, #app { height: 100%; margin: 0; font-family: system-ui, sans-serif; }
+    header { padding: 12px; border-bottom: 1px solid #e5e5e5; }
+    main { display: grid; grid-template-rows: auto 1fr auto; height: calc(100% - 56px); }
+    .grid { display: grid; gap: var(--gap); }
+    .two { grid-template-columns: 2fr 1fr; }
+    .panel { padding: 10px; }
+    #map { height: 100%; min-height: 320px; }
+    .card { border: 1px solid #e5e5e5; border-radius: 12px; padding: 12px; }
+    .row { display: flex; gap: var(--gap); flex-wrap: wrap; align-items: center; }
+    input, button, select, textarea { padding: 8px; border: 1px solid #ccc; border-radius: 8px; font-size: 14px; }
+    button { cursor: pointer; }
+    .schedule { max-height: 260px; overflow: auto; }
+    .schedule-item { display: grid; gap: 6px; padding: 8px; border: 1px dashed #ddd; border-radius: 10px; margin-bottom: 8px; }
+    .right { text-align: right; }
+    .muted { color: #666; font-size: 12px; }
+    .chat-box { display: grid; grid-template-rows: 1fr auto; height: 320px; border: 1px solid #eee; border-radius: 12px; }
+    .chat-log { overflow: auto; padding: 8px; }
+    .chat-line { margin-bottom: 6px; }
+    .chat-me { font-weight: 600; }
+    a.btn { text-decoration: none; padding: 6px 10px; border: 1px solid #ccc; border-radius: 8px; }
+  </style>
+</head>
+<body>
+  <header class="row">
+    <strong>Trip Live Map</strong>
+    <span class="muted">ใส่สถานที่/เวลา/ลิงก์ Google Maps → สร้างเมนูนำทางให้ทุกคนกดได้</span>
+  </header>
+  <main>
+    <section class="panel card grid two">
+      <div class="grid" style="gap:14px">
+        <div class="row">
+          <input id="joinCode" placeholder="Join code (เช่น demo1234)" />
+          <input id="vehicleName" placeholder="ชื่อรถ/ชื่อทีม (เช่น รถตู้ 1)" />
+          <button id="joinBtn">เข้าร่วมทริป</button>
+          <label><input type="checkbox" id="shareToggle" disabled /> แชร์ตำแหน่งของฉัน</label>
+        </div>
+
+        <div class="card">
+          <h3>เพิ่มกำหนดการ (สถานที่ + เวลา + ลิงก์ Google Maps)</h3>
+          <div class="row">
+            <input id="schTitle" placeholder="หัวข้อ (เช่น แวะหาร้านข้าวเช้า)" style="flex:1" />
+            <input id="schDate" type="date" />
+            <input id="schTime" type="time" />
+          </div>
+          <div class="row">
+            <input id="schGmaps" placeholder="ลิงก์ Google Maps (เช่น https://maps.app.goo.gl/...)" style="flex:1" />
+            <input id="schLat" type="number" step="any" placeholder="ละติจูด (ไม่บังคับ)" />
+            <input id="schLng" type="number" step="any" placeholder="ลองจิจูด (ไม่บังคับ)" />
+          </div>
+          <div class="row">
+            <textarea id="schNotes" placeholder="รายละเอียดเพิ่มเติม" rows="2" style="flex:1"></textarea>
+            <button id="addScheduleBtn">เพิ่มกำหนดการ</button>
+          </div>
+          <div class="muted">ตัวอย่าง: เสาร์ 1 พ.ย. 2568, 10:40 ถึง PB Valley + ลิงก์นำทาง</div>
+        </div>
+
+        <div class="card schedule">
+          <h3>เมนูกำหนดการ (กดเพื่อเปิดนำทาง)</h3>
+          <div id="scheduleList"></div>
+        </div>
+      </div>
+
+      <div class="grid" style="gap:14px">
+        <div id="map" class="card"></div>
+        <div class="card chat-box">
+          <div class="row" style="padding:8px">
+            <input id="chatName" placeholder="ชื่อที่ใช้คุย" style="flex:1" />
+            <button id="chatJoinBtn" disabled>เข้าร่วมการสนทนา</button>
+            <button id="chatLeaveBtn" disabled>ออก</button>
+          </div>
+          <div id="chatLog" class="chat-log"></div>
+          <div class="row" style="padding:8px">
+            <input id="chatInput" placeholder="พิมพ์ข้อความ..." style="flex:1" disabled />
+            <button id="chatSendBtn" disabled>ส่ง</button>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script>
+    const map = L.map('map').setView([13.736, 100.523], 6);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap' }).addTo(map);
+
+    const markers = new Map(); // vehicleId -> marker
+    const $ = (id) => document.getElementById(id);
+
+    let trip = null; let vehicleId = null; let watchId = null;
+
+    const socket = io({ path: '/socket.io' });
+
+    function fmt(dt) { return new Date(dt).toLocaleString('th-TH'); }
+
+    function renderSchedule(items=[]) {
+      const wrap = $('scheduleList');
+      wrap.innerHTML = '';
+      items.sort((a,b)=> new Date(a.time_start) - new Date(b.time_start));
+      for (const it of items) {
+        const div = document.createElement('div');
+        div.className = 'schedule-item';
+        const when = it.time_start ? fmt(it.time_start) : '';
+        div.innerHTML = `
+          <div><strong>${when}</strong> · ${it.title||''}</div>
+          ${it.notes?`<div class="muted">${it.notes}</div>`:''}
+          <div class="row">
+            ${it.gmaps_url?`<a class="btn" target="_blank" rel="noopener" href="${it.gmaps_url}">เปิดนำทางใน Google Maps</a>`:''}
+            ${it.lat && it.lng ? `<a class="btn" href="#" data-lat="${it.lat}" data-lng="${it.lng}">โฟกัสบนแผนที่</a>`:''}
+          </div>`;
+        if (it.lat && it.lng) {
+          div.querySelectorAll('a.btn').forEach(a=>{
+            if (a.dataset.lat) {
+              a.addEventListener('click', (ev)=>{
+                ev.preventDefault(); map.setView([parseFloat(it.lat), parseFloat(it.lng)], 14);
+              });
+            }
+          });
+        }
+        wrap.appendChild(div);
+      }
+    }
+
+    function upsertVehicleMarker(v) {
+      const key = v.id || v.vehicleId;
+      const lat = v.last_lat ?? v.lat; const lng = v.last_lng ?? v.lng;
+      if (lat == null || lng == null) return;
+      let m = markers.get(key);
+      if (!m) {
+        m = L.marker([lat, lng], { title: v.name || key });
+        m.addTo(map);
+        markers.set(key, m);
+      } else { m.setLatLng([lat, lng]); }
+      m.bindPopup(`${v.name||'Vehicle'}<br/>${(+lat).toFixed(5)}, ${(+lng).toFixed(5)}`);
+    }
+
+    async function fetchTrip(joinCode) {
+      const res = await fetch(`/api/trips/${joinCode}`);
+      if (!res.ok) throw new Error('Join code ไม่ถูกต้อง');
+      return res.json();
+    }
+
+    async function registerVehicle(tripId, name) {
+      const res = await fetch(`/api/trips/${tripId}/vehicles`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({ name }) });
+      if (!res.ok) throw new Error('ลงทะเบียนรถล้มเหลว');
+      return res.json();
+    }
+
+    async function addSchedule(tripId, data) {
+      const res = await fetch(`/api/trips/${tripId}/schedule`, { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) });
+      if (!res.ok) throw new Error('เพิ่มกำหนดการล้มเหลว');
+      return res.json();
+    }
+
+    $('joinBtn').onclick = async () => {
+      try {
+        const joinCode = $('joinCode').value.trim();
+        const name = $('vehicleName').value.trim() || 'Vehicle';
+        if (!joinCode) throw new Error('กรอก join code');
+        trip = await fetchTrip(joinCode);
+        renderSchedule(trip.schedule || []);
+        if (trip.center) map.setView([trip.center.lat, trip.center.lng], trip.center.zoom||10);
+        const reg = await registerVehicle(trip.id, name);
+        vehicleId = reg.vehicle_id;
+        socket.emit('joinTrip', { tripId: trip.id, vehicleId });
+        $('shareToggle').disabled = false;
+        $('chatJoinBtn').disabled = false;
+        alert('เข้าร่วมทริปสำเร็จ');
+      } catch(e) { alert(e.message); }
+    };
+
+    $('shareToggle').onchange = (e) => {
+      if (!trip || !vehicleId) return alert('ยังไม่ได้เข้าทริป');
+      if (e.target.checked) {
+        if (!('geolocation' in navigator)) { alert('เบราว์เซอร์ไม่รองรับ Geolocation'); e.target.checked=false; return; }
+        watchId = navigator.geolocation.watchPosition((pos)=>{
+          const { latitude:lat, longitude:lng, speed, heading } = pos.coords;
+          socket.emit('locUpdate', { tripId: trip.id, vehicleId, lat, lng, speedKmh: speed? speed*3.6: undefined, heading, ts: Date.now() });
+        }, (err)=>{ console.error(err); alert('ไม่สามารถอ่านตำแหน่งได้'); e.target.checked=false; }, { enableHighAccuracy:true, maximumAge:2000, timeout:10000 });
+      } else { if (watchId) navigator.geolocation.clearWatch(watchId); }
+    };
+
+    $('addScheduleBtn').onclick = async ()=>{
+      try {
+        if (!trip) return alert('ยังไม่ได้เข้าทริป');
+        const title = $('schTitle').value.trim();
+        const date = $('schDate').value; const time = $('schTime').value;
+        const gmaps_url = $('schGmaps').value.trim();
+        const lat = parseFloat($('schLat').value) || null;
+        const lng = parseFloat($('schLng').value) || null;
+        const notes = $('schNotes').value.trim();
+        if (!title || !date || !time) return alert('กรอกหัวข้อ/วันที่/เวลาให้ครบ');
+        const dtISO = new Date(`${date}T${time}:00`).toISOString();
+        await addSchedule(trip.id, { title, time_start: dtISO, gmaps_url, lat, lng, notes });
+        $('schTitle').value=''; $('schNotes').value=''; $('schGmaps').value=''; $('schLat').value=''; $('schLng').value='';
+      } catch(e){ alert(e.message); }
+    };
+
+    // ==== Simple room chat ====
+    function enableChatInputs(on) {
+      $('chatInput').disabled = !on; $('chatSendBtn').disabled = !on; $('chatLeaveBtn').disabled = !on; $('chatJoinBtn').disabled = on;
+    }
+
+    $('chatJoinBtn').onclick = ()=>{
+      if (!trip) return alert('ยังไม่ได้เข้าทริป');
+      const name = $('chatName').value.trim() || 'Guest';
+      socket.emit('chat:join', { tripId: trip.id, name });
+    };
+    $('chatLeaveBtn').onclick = ()=>{ if (!trip) return; socket.emit('chat:leave', { tripId: trip.id }); };
+
+    $('chatSendBtn').onclick = ()=>{
+      const text = $('chatInput').value.trim(); if (!text) return;
+      socket.emit('chat:msg', { tripId: trip.id, text }); $('chatInput').value='';
+    };
+
+    socket.on('chat:joined', ()=>{ enableChatInputs(true); addChat('✅ เข้าร่วมห้องสนทนาแล้ว'); });
+    socket.on('chat:left', ()=>{ enableChatInputs(false); addChat('👋 ออกจากห้องสนทนาแล้ว'); });
+    socket.on('chat:msg', ({ name, text, ts })=>{ addChat(`<span class="chat-me">${escapeHTML(name||'ใครสักคน')}</span>: ${escapeHTML(text)} <span class="muted">${fmt(ts)}</span>`); });
+
+    function addChat(html){ const log=$('chatLog'); const div=document.createElement('div'); div.className='chat-line'; div.innerHTML=html; log.appendChild(div); log.scrollTop=log.scrollHeight; }
+    function escapeHTML(s){ return s.replace(/[&<>\"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c])); }
+
+    // ==== Socket subscribers ====
+    socket.on('vehicles', (list)=>{ for (const v of list) upsertVehicleMarker(v); });
+    socket.on('scheduleUp', (list)=>{ renderSchedule(list); });
+
+    socket.on('connect', ()=>{ console.log('socket connected'); });
+  </script>
+</body>
+</html>
